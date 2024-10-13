@@ -1,4 +1,7 @@
 
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import BaseServer
 from OpenSSL import crypto
@@ -51,16 +54,39 @@ def generate_random_string(length):
     random_string = ''.join(random.choice(characters) for _ in range(length))
     return random_string
 
-def generate_certificate(csr_pem : str):
+def generate_certificate(csr_pem: str):
     csr = crypto.load_certificate_request(crypto.FILETYPE_PEM, csr_pem.encode('utf-8'))
+    ca_key = crypto.PKey()
+    ca_key.generate_key(crypto.TYPE_RSA, 2048)
+
     cert = crypto.X509()
     cert.set_subject(csr.get_subject())
     cert.gmtime_adj_notBefore(0)
-    cert.gmtime_adj_notAfter(365 * 24 * 60 * 60)
-    cert.set_issuer(cert.get_subject())  # 自签名
+    cert.gmtime_adj_notAfter(90 * 24 * 60 * 60)  # 证书有效期 90 天
+
+    issuer = crypto.X509Name(crypto.X509().get_subject())
+    issuer.C = "US"  # 国家代码
+    issuer.ST = "California"  # 州/省份
+    issuer.L = "San Francisco"  # 城市
+    issuer.O = "My Custom CA"  # 组织
+    issuer.OU = "IT Department"  # 组织单位
+    issuer.CN = "my-ca.example.com"  # 公共名称
+
+    cert.set_issuer(issuer)
     cert.set_pubkey(csr.get_pubkey())
-    cert.sign(csr.get_pubkey(), 'sha256')
-    return crypto.dump_certificate(crypto.FILETYPE_PEM, cert)
+
+    # 添加 SAN 扩展
+    san_extension = None
+    for ext in csr.get_extensions():
+        if ext.get_short_name().decode('utf-8') == 'subjectAltName':
+            san_extension = ext
+            break
+
+    if san_extension:
+        cert.add_extensions([san_extension])
+
+    cert.sign(ca_key, 'sha256')
+    return crypto.dump_certificate(crypto.FILETYPE_PEM, cert).decode('utf-8')
 
 @dataclass
 class Account():
@@ -102,11 +128,11 @@ class SimpleACMEServer(BaseHTTPRequestHandler):
     def _set_response(self, code=200):
         self.send_response(code)
         self.send_header('Content-type', 'application/json')
-        self.send_header('Replay-Nonce', NONCE[self.client_address])
+        self.send_header('Replay-Nonce', NONCE[self.client_address[0]])
         self.end_headers()
 
     def check_nonce(self, nonce):
-        if NONCE[self.client_address] != nonce:
+        if NONCE[self.client_address[0]] != nonce:
             print("Replay Attack detected")
             return False
         return True
@@ -118,7 +144,8 @@ class SimpleACMEServer(BaseHTTPRequestHandler):
         return True
 
     def check_client_authz(self, account_id, client_ip, client_id):
-        if self.client_address != client_ip:
+        if self.client_address[0] != client_ip:
+            print(self.client_address[0], client_ip)
             print("IP spoofing detected")
             return False
         try:
@@ -138,14 +165,14 @@ class SimpleACMEServer(BaseHTTPRequestHandler):
             return False
 
     def do_HEAD(self):
-        if self.path == "/new-nonce":
+        if self.path == "/acme/new-nonce":
             self.handle_nonce()
         else:
             self._set_response(404)
 
     def handle_nonce(self):
         new_nonce = generate_random_string(22)
-        NONCE[self.client_address] = new_nonce
+        NONCE[self.client_address[0]] = new_nonce
         self._set_response(code=200)
 
     def do_POST(self):
@@ -196,7 +223,7 @@ class SimpleACMEServer(BaseHTTPRequestHandler):
             self._set_response(403)
             return
 
-        account_id = post_data['kid']
+        account_id = post_data['kid'].split('/')[-1]
         account_public_key = post_data['account_public_key']
         identifiers = post_data['identifiers']
 
@@ -278,7 +305,7 @@ class SimpleACMEServer(BaseHTTPRequestHandler):
             self._set_response(403)
             return
 
-        account_id = post_data['kid']
+        account_id = post_data['kid'].split('/')[-1]
         account_public_key = post_data['account_public_key']
 
         if not self.check_account(account_id, account_public_key):
@@ -321,7 +348,7 @@ class SimpleACMEServer(BaseHTTPRequestHandler):
             self._set_response(403)
             return
 
-        account_id = post_data['kid']
+        account_id = post_data['kid'].split('/')[-1]
         account_public_key = post_data['account_public_key']
 
         if not self.check_account(account_id, account_public_key):
@@ -361,7 +388,7 @@ class SimpleACMEServer(BaseHTTPRequestHandler):
             self._set_response(403)
             return
 
-        account_id = post_data['kid']
+        account_id = post_data['kid'].split('/')[-1]
         account_public_key = post_data['account_public_key']
 
         if not self.check_account(account_id, account_public_key):
@@ -403,7 +430,7 @@ class SimpleACMEServer(BaseHTTPRequestHandler):
             self._set_response(403)
             return
 
-        account_id = post_data['kid']
+        account_id = post_data['kid'].split('/')[-1]
         account_public_key = post_data['account_public_key']
 
         if not self.check_account(account_id, account_public_key):
@@ -424,7 +451,10 @@ class SimpleACMEServer(BaseHTTPRequestHandler):
         target_order : Order = ORDERS[(account_id, order_id)]
         target_authz_ids = target_order.authz_ids
         for authz_id in target_authz_ids:
-            if AUTHZS_BY_ID[(account_id, authz_id)].status != "valid":
+            authz : Authz = AUTHZS_BY_ID[(account_id, authz_id)]
+            if authz.challenge.status == "valid":
+                authz.status = "valid"
+            if authz.status != "valid":
                 self._set_response(400)
                 self.wfile.write(json.dumps({"error": "Order not ready"}).encode('utf-8'))
                 return
@@ -433,7 +463,7 @@ class SimpleACMEServer(BaseHTTPRequestHandler):
         order_certificate = generate_certificate(csr)
         CERTIFICATES[(account_id, order_id)] = order_certificate
         self._set_response(200)
-        self.wfile.write(json.dumps({"certificate": order_certificate.decode('utf-8')}).encode('utf-8'))
+        self.wfile.write(json.dumps({"certificate": order_certificate}).encode('utf-8'))
 
 
 # 自定义 HTTPServer 并增加 mode 参数
@@ -449,4 +479,4 @@ def create_server(mode, address='0.0.0.0', port=8000):
     httpd.serve_forever()
 
 if __name__ == '__main__':
-    create_server(ACME)
+    create_server(ACME_MODE)

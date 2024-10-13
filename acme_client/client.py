@@ -9,18 +9,26 @@ import os
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
+from time import time, sleep
 
+import threading
 import random
 import string
 import socket
-import time
 
 def generate_csr(identifiers):
     key = crypto.PKey()
     key.generate_key(crypto.TYPE_RSA, 2048)
 
     csr = crypto.X509Req()
-    csr.get_subject().CN = identifiers[0]
+    csr.get_subject().CN = identifiers[0]  # 主域名
+
+    # 构建 SAN 列表
+    san_list = [f"DNS:{domain}" for domain in identifiers]
+    san_extension = crypto.X509Extension(
+        b"subjectAltName", False, ", ".join(san_list).encode('utf-8')
+    )
+    csr.add_extensions([san_extension])
     csr.set_pubkey(key)
     csr.sign(key, 'sha256')
 
@@ -68,6 +76,39 @@ def generate_rsa_key(key_size):
 
     return private_key_pem.decode('utf-8'), public_key_pem.decode('utf-8')
 
+def read_certificate(pem_string):
+    # 加载 PEM 字符串为 X509 对象
+    certificate = crypto.load_certificate(crypto.FILETYPE_PEM, pem_string)
+    
+    # 获取证书的相关信息
+    subject = certificate.get_subject()
+    issuer = certificate.get_issuer()
+    serial_number = certificate.get_serial_number()
+    version = certificate.get_version() + 1  # OpenSSL 版本是从0开始的
+    not_before = certificate.get_notBefore().decode('utf-8')
+    not_after = certificate.get_notAfter().decode('utf-8')
+    signature_algorithm = certificate.get_signature_algorithm().decode('utf-8')
+    
+    # 打印证书信息
+    print("Certificate:")
+    print(f"  Subject: {subject}")
+    print(f"  Issuer: {issuer}")
+    print(f"  Serial Number: {serial_number}")
+    print(f"  Version: {version}")
+    print(f"  Valid From: {not_before}")
+    print(f"  Valid To: {not_after}")
+    print(f"  Signature Algorithm: {signature_algorithm}")
+
+    # 打印 Subject Alternative Names (SAN)
+    san_extension = None
+    for i in range(certificate.get_extension_count()):
+        ext = certificate.get_extension(i)
+        if ext.get_short_name().decode('utf-8') == 'subjectAltName':
+            san_extension = ext
+            break
+
+    if san_extension:
+        print(f"  Subject Alternative Names: {san_extension}")
 
 SERVER_URL = "http://localhost:8000"
 
@@ -75,7 +116,8 @@ class SimpleACMEClient():
 
     def __init__(self) -> None:
         self.client_id = generate_random_string(22)
-        self.client_ip = socket.gethostbyname(socket.gethostname())
+        self.client_ip = "127.0.0.1"
+        # self.client_ip = socket.gethostbyname(socket.gethostname())
         self.account_private_key, self.account_public_key = generate_rsa_key(2048)
         self.client_nonce = self.get_nonce()
         self.account_id = ""
@@ -97,7 +139,7 @@ class SimpleACMEClient():
             Cache-Control: no-store
             Link: <https://example.com/acme/directory>;rel="index"
         '''
-        response : Response = requests.head(SERVER_URL + "/new-nonce")
+        response : Response = requests.head(SERVER_URL + "/acme/new-nonce")
         if response.status_code == 200:
             return response.headers["Replay-Nonce"]
         else:
@@ -144,7 +186,7 @@ class SimpleACMEClient():
             }
         '''
         data = {"account_public_key": self.account_public_key, "nonce" : self.client_nonce, "contact": email}
-        response : Response = requests.post(SERVER_URL + "/new-account", json=data)
+        response : Response = requests.post(SERVER_URL + "/acme/new-account", json=data)
         if response.status_code == 201:
             self.account_id = response.json()["Location"]
         else:
@@ -222,7 +264,7 @@ class SimpleACMEClient():
             "not_before" : not_before,
             "not_after" : not_after
         }
-        response : Response = requests.post(SERVER_URL + "/new-order", json=data)
+        response : Response = requests.post(SERVER_URL + "/acme/new-order", json=data)
         if response.status_code == 201:
             response_data = response.json()
             self.order_id = response_data["Location"]
@@ -237,19 +279,30 @@ class SimpleACMEClient():
             raise ValueError("Error when getting an new order")
 
     def authorize_client(self):
-        # post-as-get is the same as the normal authz
+        def handle_challenge(chall):
+            self.complete_challenge(chall)
+
+        threads = []
         client_challenges = self.get_client_authz_challenges(self.client_authz)
         for chall in client_challenges:
-            self.complete_challenge(chall)
-        print("Wait for the challenge to proceed")
-        time.sleep(5)
+            thread = threading.Thread(target=handle_challenge, args=(chall,))
+            threads.append(thread)
+            thread.start()
+        for thread in threads:
+            thread.join()
 
     def authorize_domains(self):
-        for authz in self.authzs:
+        def handle_authz(authz):
             chall = self.get_authz_challenge(authz)
             self.complete_challenge(chall)
-        print("Wait for the challenge to proceed")
-        time.sleep(5)
+
+        threads = []
+        for authz in self.authzs:
+            thread = threading.Thread(target=handle_authz, args=(authz,))
+            threads.append(thread)
+            thread.start()
+        for thread in threads:
+            thread.join()
 
     def get_client_authz_challenges(self, authz_url):
         data = {
@@ -261,7 +314,7 @@ class SimpleACMEClient():
         }
         response : Response = requests.post(authz_url, json=data)
         if response.status_code == 200:
-            if response.json["status"] == "pending":
+            if response.json()["status"] == "pending":
                 return response.json()["challenges"]
             else:
                 return []
@@ -321,7 +374,7 @@ class SimpleACMEClient():
         }
         response : Response = requests.post(authz_url, json=data)
         if response.status_code == 200:
-            if response.json["status"] == "pending":
+            if response.json()["status"] == "pending":
                 return response.json()["challenge"]
             else:
                 return None
@@ -361,13 +414,15 @@ class SimpleACMEClient():
             "client_id" : self.client_id,
             "token" : challenge["token"]
         }
+        # simulate the challenge process
+        sleep(5)
         response : Response = requests.post(challenge["url"], json=data)
         if response.status_code == 200:
             pass
-        elif response.status_code == 401:
-            self.client_authz = response.json()["Location"]
-            self.authorize_client()
-            self.complete_challenge(challenge)
+        # elif response.status_code == 401:
+        #     self.client_authz = response.json()["Location"]
+        #     self.authorize_client()
+        #     self.complete_challenge(challenge)
         else:
             url = challenge["url"]
             print(f"Challenge to {url} failed")
@@ -434,6 +489,7 @@ class SimpleACMEClient():
             self.authorize_client()
             self.finalize_order(csr_pem)
         else:
+            print(response.content)
             raise ValueError("Error when finalizing the order")
 
     def run(self, email, ids):
@@ -449,12 +505,30 @@ class SimpleACMEClient():
 
         # 完成订单并获取证书
         self.finalize_order(csr_pem)
-        print("Certificate received:")
-        print(self.certificate)
+        read_certificate(self.certificate)
+
+def generate_domains(length):
+    domains = []
+    for i in range(length):
+        domains.append(f"www.example{i}.com")
+    return domains
 
 if __name__ == '__main__':
-    email = "you@example.com"
-    identifiers = ["example.com"]
+    email = "example@example.com"
 
-    client = SimpleACMEClient()
-    client.run(email, identifiers)
+    _time = []
+    for i in [1, 5, 10, 50, 100]:
+        identifiers = generate_domains(i)
+        start = time()
+        client = SimpleACMEClient()
+        client.run(email, identifiers)
+        end = time()
+
+        delta_time = end - start
+        print(f"Time taken for {i} domains: {delta_time} seconds")
+        _time.append(delta_time)
+
+    print(_time)
+
+# PLUS [28.46462392807007, 28.475237369537354, 29.000176668167114, 29.489553451538086, 30.080427169799805]
+# ACME [17.357086181640625, 17.390870809555054, 17.349021673202515, 18.374998569488525, 18.449873208999634]
