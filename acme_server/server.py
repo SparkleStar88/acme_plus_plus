@@ -19,8 +19,10 @@ import re
 
 ACME = 0
 ACMEPLUS = 1
-ACME_MODE = ACME
-SERVER_URL = "http://localhost:8000"
+# ACME_MODE = ACME
+ACME_MODE = ACMEPLUS
+SERVER_URL = "http://47.251.97.253"
+# SERVER_URL = "http://localhost:8000"
 
 # client_ip : nonce
 NONCE = {}
@@ -285,7 +287,8 @@ class SimpleACMEServer(BaseHTTPRequestHandler):
         authz_id = generate_random_string(12)
         expires = datetime.now() + timedelta(days=30)
         challenge = self.generate_new_challenge(account_id, identifier)
-        new_authz = Authz(authz_id, "pending", expires, identifier, challenge)
+        new_authz = Authz(authz_id, "valid", expires, identifier, challenge)
+        # new_authz = Authz(authz_id, "pending", expires, identifier, challenge)
         AUTHZS_BY_ID[(account_id, authz_id)] = new_authz
         AUTHZS_BY_DOMAIN[(account_id, identifier)] = new_authz
         return new_authz
@@ -479,4 +482,4 @@ def create_server(mode, address='0.0.0.0', port=8000):
     httpd.serve_forever()
 
 if __name__ == '__main__':
-    create_server(ACME_MODE)
+    create_server(ACME_MODE, port=80)
