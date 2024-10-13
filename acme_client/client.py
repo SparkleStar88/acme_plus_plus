@@ -110,13 +110,21 @@ def read_certificate(pem_string):
     if san_extension:
         print(f"  Subject Alternative Names: {san_extension}")
 
-SERVER_URL = "http://localhost:8000"
+def transmitted_bytes_count(response):
+    sent_bytes = len(response.request.body or '') + sum(len(k) + len(v) for k, v in response.request.headers.items())
+    received_bytes = len(response.content) + sum(len(k) + len(v) for k, v in response.headers.items())
+    return sent_bytes + received_bytes
+
+transmit_bytes = 0
+SERVER_URL = "http://47.251.97.253"
+# SERVER_URL = "http://localhost:8000"
 
 class SimpleACMEClient():
 
     def __init__(self) -> None:
         self.client_id = generate_random_string(22)
-        self.client_ip = "127.0.0.1"
+        self.client_ip = "8.152.209.27"
+        # self.client_ip = "127.0.0.1"
         # self.client_ip = socket.gethostbyname(socket.gethostname())
         self.account_private_key, self.account_public_key = generate_rsa_key(2048)
         self.client_nonce = self.get_nonce()
@@ -140,6 +148,8 @@ class SimpleACMEClient():
             Link: <https://example.com/acme/directory>;rel="index"
         '''
         response : Response = requests.head(SERVER_URL + "/acme/new-nonce")
+        global transmit_bytes
+        transmit_bytes += transmitted_bytes_count(response)
         if response.status_code == 200:
             return response.headers["Replay-Nonce"]
         else:
@@ -187,6 +197,8 @@ class SimpleACMEClient():
         '''
         data = {"account_public_key": self.account_public_key, "nonce" : self.client_nonce, "contact": email}
         response : Response = requests.post(SERVER_URL + "/acme/new-account", json=data)
+        global transmit_bytes
+        transmit_bytes += transmitted_bytes_count(response)
         if response.status_code == 201:
             self.account_id = response.json()["Location"]
         else:
@@ -265,6 +277,8 @@ class SimpleACMEClient():
             "not_after" : not_after
         }
         response : Response = requests.post(SERVER_URL + "/acme/new-order", json=data)
+        global transmit_bytes
+        transmit_bytes += transmitted_bytes_count(response)
         if response.status_code == 201:
             response_data = response.json()
             self.order_id = response_data["Location"]
@@ -280,7 +294,8 @@ class SimpleACMEClient():
 
     def authorize_client(self):
         def handle_challenge(chall):
-            self.complete_challenge(chall)
+            if chall:
+                self.complete_challenge(chall)
 
         threads = []
         client_challenges = self.get_client_authz_challenges(self.client_authz)
@@ -294,7 +309,8 @@ class SimpleACMEClient():
     def authorize_domains(self):
         def handle_authz(authz):
             chall = self.get_authz_challenge(authz)
-            self.complete_challenge(chall)
+            if chall:
+                self.complete_challenge(chall)
 
         threads = []
         for authz in self.authzs:
@@ -313,6 +329,8 @@ class SimpleACMEClient():
             "client_id" : self.client_id,
         }
         response : Response = requests.post(authz_url, json=data)
+        global transmit_bytes
+        transmit_bytes += transmitted_bytes_count(response)
         if response.status_code == 200:
             if response.json()["status"] == "pending":
                 return response.json()["challenges"]
@@ -373,6 +391,8 @@ class SimpleACMEClient():
             "client_id" : self.client_id,
         }
         response : Response = requests.post(authz_url, json=data)
+        global transmit_bytes
+        transmit_bytes += transmitted_bytes_count(response)
         if response.status_code == 200:
             if response.json()["status"] == "pending":
                 return response.json()["challenge"]
@@ -415,8 +435,10 @@ class SimpleACMEClient():
             "token" : challenge["token"]
         }
         # simulate the challenge process
-        sleep(5)
+        # sleep(5)
         response : Response = requests.post(challenge["url"], json=data)
+        global transmit_bytes
+        transmit_bytes += transmitted_bytes_count(response)
         if response.status_code == 200:
             pass
         # elif response.status_code == 401:
@@ -482,6 +504,8 @@ class SimpleACMEClient():
             "csr" : csr_pem
         }
         response : Response = requests.post(self.finalize_id, json=data)
+        global transmit_bytes
+        transmit_bytes += transmitted_bytes_count(response)
         if response.status_code == 200:
             self.certificate = response.json()["certificate"]
         elif response.status_code == 401:
@@ -517,6 +541,7 @@ if __name__ == '__main__':
     email = "example@example.com"
 
     _time = []
+    _bytes = []
     for i in [1, 5, 10, 50, 100]:
         identifiers = generate_domains(i)
         start = time()
@@ -527,8 +552,17 @@ if __name__ == '__main__':
         delta_time = end - start
         print(f"Time taken for {i} domains: {delta_time} seconds")
         _time.append(delta_time)
+        _bytes.append(transmit_bytes)
+        transmit_bytes = 0
 
     print(_time)
+    print(_bytes)
 
-# PLUS [28.46462392807007, 28.475237369537354, 29.000176668167114, 29.489553451538086, 30.080427169799805]
-# ACME [17.357086181640625, 17.390870809555054, 17.349021673202515, 18.374998569488525, 18.449873208999634]
+# PLUS [3.4681572914123535, 3.5333917140960693, 4.760978937149048, 4.9987711906433105, 5.611949443817139]
+# ACME [2.5421602725982666, 3.9698822498321533, 4.577599048614502, 3.8507425785064697, 3.9924087524414062]
+
+# ACME [2.1763644218444824, 2.1811258792877197, 2.8115971088409424, 2.9772026538848877, 3.7963321208953857]
+# ACME++ [3.530317544937134, 4.427361488342285, 3.430997371673584, 5.334638833999634, 5.115685224533081]
+
+# ACME [7526, 16392, 27487, 116356, 227416]
+# ACME++ [10730, 21878, 34174, 126086, 239297]
